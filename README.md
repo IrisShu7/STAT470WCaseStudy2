@@ -1,2 +1,446 @@
 # STAT470WCaseStudy2
 Code and work repo for group 4 members
+# ============================================================
+# CASE STUDY 2: LEGO SETS — EXPLORATORY DATA ANALYSIS
+# ============================================================
+
+
+
+library(tidyverse)
+
+theme_set(theme_classic(base_size = 12))
+
+# 1. IMPORT
+lego_raw <- read_csv(
+  file.choose(),
+  locale = locale(encoding = "Windows-1252"),
+  na = c("", "NA", "N/A"),
+  show_col_types = FALSE
+)
+
+dim(lego_raw)
+names(lego_raw)
+glimpse(lego_raw)
+
+# ============================================================
+# 2. CLEAN PRICES, WEIGHT, AGE, AND CATEGORICAL VARIABLES
+# ============================================================
+
+lego <- lego_raw %>%
+  mutate(
+    across(where(is.character), str_trim),
+
+    # Convert currency strings into numeric dollar amounts.
+    Price = parse_number(Price),
+    Amazon_Price = parse_number(Amazon_Price),
+
+    # Weight strings begin with kilograms, followed by pounds.
+    Weight_kg = parse_number(Weight),
+
+    # Extract the minimum recommended age.
+    # For example: Ages_1½+ becomes 1.5; Ages_5-12 becomes 5.
+    Age_text = str_remove(Ages, "^Ages_"),
+    Age_text = str_replace_all(Age_text, fixed("½"), ".5"),
+    Age_text = na_if(Age_text, "NA"),
+    Min_Age = as.numeric(
+      str_extract(Age_text, "^[0-9]+(?:\\.[0-9]+)?")
+    ),
+
+    Year = factor(Year),
+    across(c(Theme, Packaging, Availability, Size), as.factor)
+  ) %>%
+  select(-Age_text)
+
+# Do NOT replace missing Minifigures with zero.
+# The instructions say NA can mean either zero or missing.
+# Do NOT delete every row with any missing value.
+
+# Check for repeated item numbers; do not remove automatically.
+duplicate_items <- lego %>%
+  count(Item_Number, name = "Number_of_records") %>%
+  filter(Number_of_records > 1)
+
+print(duplicate_items)
+
+# Check for nonpositive prices before using logarithmic axes.
+lego %>%
+  filter(!is.na(Amazon_Price), Amazon_Price <= 0) %>%
+  select(Item_Number, Set_Name, Amazon_Price) %>%
+  print()
+
+# ============================================================
+# 3. MISSING VALUES
+# ============================================================
+
+analysis_vars <- c(
+  "Amazon_Price", "Pieces", "Min_Age", "Pages",
+  "Minifigures", "Weight_kg", "Unique_Pieces",
+  "Theme", "Year", "Packaging", "Availability", "Size"
+)
+
+missing_summary <- lego %>%
+  summarise(across(all_of(analysis_vars), ~ sum(is.na(.x)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Variable",
+    values_to = "Missing"
+  ) %>%
+  mutate(
+    Available = nrow(lego) - Missing,
+    Percent_missing = 100 * Missing / nrow(lego)
+  ) %>%
+  arrange(desc(Percent_missing))
+
+print(missing_summary)
+
+p_missing <- ggplot(
+  missing_summary,
+  aes(x = reorder(Variable, Percent_missing), y = Percent_missing)
+) +
+  geom_col(fill = "grey45") +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "%"),
+    limits = c(0, 100)
+  ) +
+  labs(
+    title = "Availability of information across LEGO sets",
+    x = NULL,
+    y = "Percentage missing"
+  )
+
+print(p_missing)
+
+# Keep the full dataset for general descriptions.
+# Use observed Amazon prices for price-related comparisons.
+priced <- lego %>%
+  filter(!is.na(Amazon_Price))
+
+# Positive prices are required for a log10 price axis.
+priced_positive <- priced %>%
+  filter(Amazon_Price > 0)
+
+cat("\nTotal sets:", nrow(lego),
+    "\nSets with Amazon prices:", nrow(priced),
+    "\nSets missing Amazon prices:",
+    sum(is.na(lego$Amazon_Price)), "\n")
+
+# Check whether Amazon-price availability differs by year.
+price_availability <- lego %>%
+  group_by(Year) %>%
+  summarise(
+    Total_sets = n(),
+    Amazon_price_available = sum(!is.na(Amazon_Price)),
+    Percent_available = 100 * mean(!is.na(Amazon_Price)),
+    .groups = "drop"
+  )
+
+print(price_availability)
+
+# ============================================================
+# 4. NUMERICAL SUMMARIES
+# ============================================================
+
+numeric_vars <- c(
+  "Amazon_Price", "Pieces", "Min_Age", "Pages",
+  "Minifigures", "Weight_kg", "Unique_Pieces"
+)
+
+numeric_summary <- lego %>%
+  select(all_of(numeric_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  group_by(Variable) %>%
+  summarise(
+    Available = sum(!is.na(Value)),
+    Missing = sum(is.na(Value)),
+    Mean = mean(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE),
+    Minimum = min(Value, na.rm = TRUE),
+    Q1 = quantile(Value, 0.25, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    Q3 = quantile(Value, 0.75, na.rm = TRUE),
+    Maximum = max(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(numeric_summary, width = Inf)
+
+# Counts for categorical variables, including missing values.
+categorical_vars <- c(
+  "Theme", "Year", "Packaging", "Availability", "Size"
+)
+
+for (v in categorical_vars) {
+  cat("\nCounts for", v, "\n")
+  print(
+    lego %>%
+      count(.data[[v]], sort = TRUE, name = "Number_of_sets")
+  )
+}
+
+# ============================================================
+# 5. DISTRIBUTION OF AMAZON PRICE
+# ============================================================
+
+p_price <- ggplot(priced, aes(x = Amazon_Price)) +
+  geom_histogram(bins = 30, fill = "grey65", color = "white") +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Distribution of Amazon prices",
+    x = "Amazon price",
+    y = "Number of sets"
+  )
+
+print(p_price)
+
+# A second view makes differences among lower prices clearer.
+p_price_log <- ggplot(priced_positive, aes(x = Amazon_Price)) +
+  geom_histogram(bins = 30, fill = "grey65", color = "white") +
+  scale_x_log10(labels = scales::label_dollar()) +
+  labs(
+    title = "Distribution of Amazon prices on a logarithmic scale",
+    x = "Amazon price (logarithmic scale)",
+    y = "Number of sets"
+  )
+
+print(p_price_log)
+
+# ============================================================
+# 6. DISTRIBUTIONS OF NUMERIC SET CHARACTERISTICS
+# ============================================================
+
+predictor_vars <- setdiff(numeric_vars, "Amazon_Price")
+
+predictor_long <- lego %>%
+  select(all_of(predictor_vars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Characteristic",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(Value))
+
+p_distributions <- ggplot(predictor_long, aes(x = Value)) +
+  geom_histogram(bins = 25, fill = "grey65", color = "white") +
+  facet_wrap(~ Characteristic, scales = "free", ncol = 3) +
+  labs(
+    title = "Distributions of LEGO set characteristics",
+    x = "Recorded value",
+    y = "Number of sets"
+  )
+
+print(p_distributions)
+
+# ============================================================
+# 7. AMAZON PRICE VERSUS NUMERIC CHARACTERISTICS
+# ============================================================
+
+price_predictor_long <- priced_positive %>%
+  select(Amazon_Price, all_of(predictor_vars)) %>%
+  pivot_longer(
+    all_of(predictor_vars),
+    names_to = "Characteristic",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(Value))
+
+p_relationships <- ggplot(
+  price_predictor_long,
+  aes(x = Value, y = Amazon_Price)
+) +
+  geom_point(alpha = 0.45, size = 1.5) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  facet_wrap(~ Characteristic, scales = "free_x", ncol = 3) +
+  labs(
+    title = "Amazon price and set characteristics",
+    subtitle = "Each panel uses sets with both measurements available",
+    x = "Recorded characteristic value",
+    y = "Amazon price (logarithmic scale)"
+  )
+
+print(p_relationships)
+
+# ============================================================
+# 8. PRICE COMPARISONS BY YEAR, BRICK SIZE, AND AVAILABILITY
+# ============================================================
+
+for (v in c("Year", "Size", "Availability")) {
+
+  group_data <- priced_positive %>%
+    filter(!is.na(.data[[v]]))
+
+  group_summary <- group_data %>%
+    group_by(across(all_of(v))) %>%
+    summarise(
+      Number_of_sets = n(),
+      Median_price = median(Amazon_Price),
+      Q1 = quantile(Amazon_Price, 0.25),
+      Q3 = quantile(Amazon_Price, 0.75),
+      .groups = "drop"
+    )
+
+  cat("\nAmazon price summary by", v, "\n")
+  print(group_summary)
+
+  p_group <- ggplot(
+    group_data,
+    aes(x = .data[[v]], y = Amazon_Price)
+  ) +
+    geom_boxplot(fill = "grey85", outlier.size = 1.5) +
+    scale_y_log10(labels = scales::label_dollar()) +
+    labs(
+      title = paste("Amazon price by", tolower(v)),
+      x = v,
+      y = "Amazon price (logarithmic scale)"
+    ) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+  print(p_group)
+}
+
+# ============================================================
+# 9. AMAZON PRICE BY THEME
+# ============================================================
+
+# Use the 10 themes with the most observed positive prices.
+top_themes <- priced_positive %>%
+  filter(!is.na(Theme)) %>%
+  count(Theme, sort = TRUE) %>%
+  slice_head(n = 10)
+
+print(top_themes)
+
+theme_data <- priced_positive %>%
+  semi_join(top_themes, by = "Theme")
+
+p_theme <- ggplot(
+  theme_data,
+  aes(
+    x = reorder(Theme, Amazon_Price, FUN = median),
+    y = Amazon_Price
+  )
+) +
+  geom_boxplot(fill = "grey85", outlier.size = 1.5) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  coord_flip() +
+  labs(
+    title = "Amazon prices across the 10 most frequent priced themes",
+    x = NULL,
+    y = "Amazon price (logarithmic scale)"
+  )
+
+print(p_theme)
+
+# ============================================================
+# 10. MULTIVARIABLE EDA: PIECES, PRICE, AND BRICK SIZE
+# ============================================================
+
+pieces_size <- priced_positive %>%
+  filter(!is.na(Pieces), Pieces > 0, !is.na(Size))
+
+p_size_relationship <- ggplot(
+  pieces_size,
+  aes(x = Pieces, y = Amazon_Price, color = Size, shape = Size)
+) +
+  geom_point(alpha = 0.65, size = 2) +
+  scale_x_log10(labels = scales::label_comma()) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  scale_color_manual(values = c("Large" = "#0072B2", "Small" = "#D55E00")) +
+  labs(
+    title = "Amazon price and piece count by brick size",
+    x = "Number of pieces (logarithmic scale)",
+    y = "Amazon price (logarithmic scale)",
+    color = "Brick size",
+    shape = "Brick size"
+  )
+
+print(p_size_relationship)
+
+# ============================================================
+# 11. SPEARMAN CORRELATIONS
+# ============================================================
+
+# Exclude identifiers, categorical variables, and LEGO Price.
+# Pairwise complete observations retain more available data.
+# Sample sizes differ across correlations and are printed below.
+
+correlation_data <- lego %>%
+  select(all_of(numeric_vars))
+
+spearman_matrix <- cor(
+  correlation_data,
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+pairwise_n <- crossprod(
+  as.matrix(!is.na(correlation_data)) * 1
+)
+
+cat("\nSpearman correlations:\n")
+print(round(spearman_matrix, 2))
+
+cat("\nNumber of observations used for each correlation:\n")
+print(pairwise_n)
+
+correlation_long <- as.data.frame(spearman_matrix) %>%
+  rownames_to_column("Variable_1") %>%
+  pivot_longer(
+    -Variable_1,
+    names_to = "Variable_2",
+    values_to = "Correlation"
+  ) %>%
+  mutate(
+    Row = match(Variable_1, numeric_vars),
+    Column = match(Variable_2, numeric_vars)
+  ) %>%
+  filter(Row > Column) %>%  # Avoid duplicated correlations.
+  mutate(
+    Variable_1 = factor(Variable_1, levels = rev(numeric_vars)),
+    Variable_2 = factor(Variable_2, levels = numeric_vars)
+  )
+
+p_correlations <- ggplot(
+  correlation_long,
+  aes(x = Variable_2, y = Variable_1, fill = Correlation)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3.5) +
+  scale_fill_gradient2(
+    low = "#D55E00",
+    mid = "white",
+    high = "#56B4E9",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    title = "Spearman correlations among numeric characteristics",
+    subtitle = "Pairwise available observations; sample sizes vary",
+    x = NULL,
+    y = NULL,
+    fill = "Correlation"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_correlations)
+
+# ============================================================
+# 12. INSPECT EXTREME PRICES
+# ============================================================
+
+# Inspect unusual observations rather than automatically deleting.
+highest_prices <- priced %>%
+  arrange(desc(Amazon_Price)) %>%
+  select(
+    Item_Number, Set_Name, Theme, Amazon_Price,
+    Pieces, Year, Minifigures
+  ) %>%
+  slice_head(n = 10)
+
+print(highest_prices, width = Inf)
+
