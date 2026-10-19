@@ -1,0 +1,46 @@
+{
+  "n_total": 1304,
+  "n_observed_price": 826,
+  "n_eligible": 826,
+  "n_train": 660,
+  "n_test": 166,
+  "selected": "Log price: theme + construction",
+  "selected_index": 4,
+  "CV": [
+    {
+      "Model": "Raw price: pieces",
+      "CV_RMSE": 39.89250633401958,
+      "CV_MAE": 22.89542722020497
+    },
+    {
+      "Model": "Log price: log pieces",
+      "CV_RMSE": 46.03922247597773,
+      "CV_MAE": 25.256749773214366
+    },
+    {
+      "Model": "Log price: structure",
+      "CV_RMSE": 37.866908872185455,
+      "CV_MAE": 19.94789724088807
+    },
+    {
+      "Model": "Log price: theme",
+      "CV_RMSE": 35.73610065239447,
+      "CV_MAE": 18.603971384088574
+    },
+    {
+      "Model": "Log price: theme + construction",
+      "CV_RMSE": 35.17639388028819,
+      "CV_MAE": 18.212473667617108
+    }
+  ],
+  "test_RMSE": 53.64326459194995,
+  "test_MAE": 23.005837108718488,
+  "test_R2": 0.2030328088399368,
+  "smearing": 1.1105492702032655,
+  "train_R2_log": 0.7508229360002577,
+  "test_mean_baseline_RMSE": 60.09434435623431,
+  "BP_p": 3.751829436705915e-15,
+  "max_cook": 0.09838824430193666,
+  "sensitivity_removed_set": "White Baseplate",
+  "sensitivity_test_RMSE": 49.93234344176326
+}

@@ -1,0 +1,1 @@
+LEGO modeling analysis. Install pandas, numpy, scipy, matplotlib, statsmodels and scikit-learn. Run python modeling.py then python make_report.py. Input CSV is included. Seed 123. Model selection uses training-fold cross-validation; test results are for internal validation. See HTML report for limitations.
