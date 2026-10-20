@@ -1,0 +1,212 @@
+---
+title: "LEGO Modeling"
+output: html_document
+---
+
+```{r modeling}
+# LEGO CASE STUDY: COMPLETE MODELING WORKFLOW
+# Base R only; no additional packages required.
+# In RStudio, run this script and select case-study2-data (1).csv.
+# The split and folds are generated automatically using seed 123.
+# R and Python use different random generators: update the report with these R results.
+
+# 1. LOAD AND CLEAN DATA --------------------------------------------------
+input_file <- file.choose()
+x <- read.csv(input_file, fileEncoding = 'windows-1252',
+              stringsAsFactors = FALSE, na.strings = c('', 'NA'))
+x$row_id <- seq_len(nrow(x))
+x$Amazon_Price <- as.numeric(gsub('[$, ]', '', x$Amazon_Price))
+age_text <- gsub('\u00bd', '.5', x$Ages)
+matched <- grepl('Ages_[0-9]+', age_text)
+x$age <- NA_real_
+x$age[matched] <- as.numeric(sub('.*Ages_([0-9]+(?:\\.[0-9]+)?).*',
+                                '\\1', age_text[matched], perl = TRUE))
+d <- x[!is.na(x$Amazon_Price) & x$Amazon_Price > 0 &
+       !is.na(x$Pieces) & x$Pieces > 0, ]
+stopifnot(nrow(x) == 1304, nrow(d) == 826)
+output_dir <- file.path(dirname(input_file), 'LEGO_modeling_results')
+dir.create(output_dir, showWarnings = FALSE)
+
+# 2. AUTOMATIC TRAINING/TEST SPLIT ----------------------------------------
+set.seed(123)
+train_rows <- sample(seq_len(nrow(d)), size = floor(0.80 * nrow(d)))
+test_rows <- setdiff(seq_len(nrow(d)), train_rows)
+train <- d[train_rows, ]
+test <- d[test_rows, ]
+fold_id <- sample(rep(1:5, length.out = nrow(train)))
+cat('Training sets:', nrow(train), '\nTest sets:', nrow(test), '\n')
+print(table(fold_id))
+
+model_names <- c('Raw price: pieces', 'Log price: log pieces',
+                 'Log price: structure', 'Log price: theme',
+                 'Log price: theme + construction')
+
+# 2. PREPROCESS USING TRAINING DATA ONLY ----------------------------------
+# For log models, imputation is on the transformed scale.
+# Missing minifigures can indicate zero OR unknown; never replace all by zero.
+# Indicators require >=5 missing training observations to avoid singleton fits.
+# Pool themes with fewer than 15 training observations into Other.
+make_design <- function(a, b, model) {
+  A <- matrix(1, nrow(a), 1, dimnames = list(NULL, 'Intercept'))
+  B <- matrix(1, nrow(b), 1, dimnames = list(NULL, 'Intercept'))
+  columns <- 'Pieces'
+  labels <- if (model == 1) 'pieces' else 'log_pieces'
+  if (model >= 3) {
+    columns <- c(columns, 'Minifigures', 'age')
+    labels <- c(labels, 'log1p_minifigures', 'minimum_age')
+  }
+  if (model == 5) {
+    columns <- c(columns, 'Pages', 'Unique_Pieces')
+    labels <- c(labels, 'log_pages', 'log_unique_pieces')
+  }
+  for (j in seq_along(columns)) {
+    col <- columns[j]; aa <- a[[col]]; bb <- b[[col]]
+    if (model > 1 && col != 'age') {
+      aa <- if (col == 'Minifigures') log1p(aa) else log(aa)
+      bb <- if (col == 'Minifigures') log1p(bb) else log(bb)
+    }
+    missing_a <- is.na(aa); missing_b <- is.na(bb)
+    med <- median(aa, na.rm = TRUE)
+    aa[missing_a] <- med; bb[missing_b] <- med
+    A <- cbind(A, aa); B <- cbind(B, bb)
+    colnames(A)[ncol(A)] <- colnames(B)[ncol(B)] <- labels[j]
+    if (sum(missing_a) >= 5) {
+      A <- cbind(A, as.numeric(missing_a)); B <- cbind(B, as.numeric(missing_b))
+      colnames(A)[ncol(A)] <- colnames(B)[ncol(B)] <- paste0(labels[j], '_missing')
+    }
+  }
+  cats <- if (model >= 3) 'Year' else character()
+  if (model == 3) cats <- c(cats, 'Size')
+  if (model >= 4) cats <- c(cats, 'Theme')
+  for (col in cats) {
+    aa <- as.character(a[[col]]); bb <- as.character(b[[col]])
+    aa[is.na(aa)] <- 'Unknown'; bb[is.na(bb)] <- 'Unknown'
+    if (col == 'Theme') {
+      counts <- table(aa); common <- names(counts[counts >= 15])
+      aa[!aa %in% common] <- 'Other'; bb[!bb %in% common] <- 'Other'
+    }
+    levels <- sort(unique(aa), method = 'radix')
+    if (length(levels) > 1) for (lev in levels[-1]) {
+      A <- cbind(A, as.numeric(aa == lev)); B <- cbind(B, as.numeric(bb == lev))
+      colnames(A)[ncol(A)] <- colnames(B)[ncol(B)] <- paste(col, lev, sep = '_')
+    }
+  }
+  list(A = A, B = B)
+}
+
+# 3. FIT AND BACK-TRANSFORM -----------------------------------------------
+fit_predict <- function(a, b, model) {
+  design <- make_design(a, b, model)
+  y <- if (model == 1) a$Amazon_Price else log(a$Amazon_Price)
+  fit <- lm.fit(design$A, y)
+  if (fit$rank < ncol(design$A)) stop('Rank-deficient design: inspect predictors.')
+  smearing <- if (model == 1) 1 else mean(exp(fit$residuals))
+  prediction <- drop(design$B %*% fit$coefficients)
+  if (model > 1) prediction <- exp(prediction) * smearing
+  list(prediction = prediction, fit = fit, A = design$A,
+       B = design$B, y = y, smearing = smearing)
+}
+rmse <- function(y, p) sqrt(mean((y - p)^2))
+mae <- function(y, p) mean(abs(y - p))
+
+# 4. FIVE-FOLD CROSS-VALIDATION ON TRAINING DATA ---------------------------
+comparison <- data.frame(Model = model_names, CV_RMSE = NA_real_, CV_MAE = NA_real_)
+for (model in 1:5) {
+  predictions <- numeric(nrow(train))
+  for (fold in 1:5) {
+    validation <- fold_id == fold
+    predictions[validation] <- fit_predict(train[!validation, ],
+                                            train[validation, ], model)$prediction
+  }
+  comparison$CV_RMSE[model] <- rmse(train$Amazon_Price, predictions)
+  comparison$CV_MAE[model] <- mae(train$Amazon_Price, predictions)
+}
+print(comparison)
+write.csv(comparison, file.path(output_dir, 'model_comparison.csv'), row.names = FALSE)
+selected <- which.min(comparison$CV_RMSE)
+cat('\nSelected model:', model_names[selected], '\n')
+
+# 5. HELD-OUT EVALUATION --------------------------------------------------
+result <- fit_predict(train, test, selected)
+pred <- result$prediction
+metrics <- data.frame(
+  Measure = c('Test RMSE', 'Test MAE', 'Test R-squared', 'Mean baseline RMSE', 'Smearing factor'),
+  Value = c(rmse(test$Amazon_Price, pred), mae(test$Amazon_Price, pred),
+            1 - sum((test$Amazon_Price - pred)^2) / sum((test$Amazon_Price - mean(test$Amazon_Price))^2),
+            rmse(test$Amazon_Price, rep(mean(train$Amazon_Price), nrow(test))), result$smearing))
+print(metrics)
+write.csv(metrics, file.path(output_dir, 'test_metrics.csv'), row.names = FALSE)
+held_out <- data.frame(Item_Number = test$Item_Number, Set_Name = test$Set_Name,
+                       Observed = test$Amazon_Price, Predicted = pred,
+                       Error = pred - test$Amazon_Price)
+write.csv(held_out, file.path(output_dir, 'held_out_predictions.csv'), row.names = FALSE)
+print(head(held_out[order(abs(held_out$Error), decreasing = TRUE), ], 5))
+
+# 6. HC3 ROBUST COEFFICIENT INTERVALS --------------------------------------
+# Intervals are conditional on the selected model and imputed predictors.
+# They do not account for model-selection uncertainty.
+A <- result$A; e <- result$fit$residuals; fitted <- result$fit$fitted.values
+n <- nrow(A); p <- ncol(A)
+bread <- solve(crossprod(A))
+h <- rowSums((A %*% bread) * A)
+V_HC3 <- bread %*% crossprod(A, A * as.numeric((e / (1 - h))^2)) %*% bread
+se <- sqrt(diag(V_HC3)); beta <- result$fit$coefficients
+critical <- qt(.975, df = n - p)
+coefficients <- data.frame(Term = colnames(A), Estimate = beta, HC3_SE = se,
+                           CI_low = beta - critical * se, CI_high = beta + critical * se,
+                           p_value = 2 * pt(abs(beta / se), df = n - p, lower.tail = FALSE))
+print(coefficients, row.names = FALSE)
+write.csv(coefficients, file.path(output_dir, 'coefficients.csv'), row.names = FALSE)
+
+# 7. DIAGNOSTICS AND INFLUENCE --------------------------------------------
+# Studentized Breusch-Pagan LM statistic (same default as statsmodels).
+aux <- lm.fit(A, e^2)
+aux_r2 <- 1 - sum(aux$residuals^2) / sum((e^2 - mean(e^2))^2)
+bp_stat <- n * aux_r2
+cat('\nBreusch-Pagan p-value:', pchisq(bp_stat, p - 1, lower.tail = FALSE), '\n')
+mse <- sum(e^2) / (n - p)
+cooks <- e^2 / (p * mse) * h / (1 - h)^2
+largest <- which.max(cooks)
+cat('Largest Cook distance:', max(cooks), '\nSet:', train$Set_Name[largest], '\n')
+# Sensitivity only: do NOT remove the observation from the primary results.
+sensitivity <- fit_predict(train[-largest, ], test, selected)
+cat('Sensitivity RMSE excluding this training observation:',
+    rmse(test$Amazon_Price, sensitivity$prediction), '\n')
+
+# 8. SAVE COLORLESS GRAPHS ------------------------------------------------
+png(file.path(output_dir, 'model_comparison.png'), width = 1800, height = 1000, res = 200)
+par(mar = c(5, 15, 2, 1))
+barplot(rev(comparison$CV_RMSE), names.arg = rev(model_names), horiz = TRUE,
+        las = 1, col = 'white', border = 'black',
+        xlab = 'Training cross-validation RMSE ($)')
+dev.off()
+png(file.path(output_dir, 'predictions.png'), width = 1400, height = 1200, res = 200)
+limits <- range(c(0, test$Amazon_Price, pred))
+plot(test$Amazon_Price, pred, pch = 1, xlim = limits, ylim = limits,
+     xlab = 'Observed Amazon price ($)', ylab = 'Predicted Amazon price ($)',
+     main = 'Held-out predictions')
+abline(0, 1, lty = 2)
+dev.off()
+png(file.path(output_dir, 'diagnostics.png'), width = 2000, height = 900, res = 200)
+par(mfrow = c(1, 2))
+plot(fitted, e, pch = 1, xlab = 'Fitted log price', ylab = 'Residual',
+     main = 'Training residuals')
+abline(h = 0, lty = 2)
+qqnorm(e, pch = 1, main = 'Normal Q-Q plot'); qqline(e, col = 'black')
+dev.off()
+png(file.path(output_dir, 'cooks_distance.png'), width = 1600, height = 1000, res = 200)
+plot(cooks, type = 'h', xlab = 'Training observation', ylab = "Cook's distance",
+     main = 'Influence diagnostics')
+abline(h = 4/n, lty = 2)
+dev.off()
+
+# 9. RECORD REPRODUCIBILITY DETAILS ---------------------------------------
+write.csv(data.frame(row_id = train$row_id, fold = fold_id),
+          file.path(output_dir, 'training_split.csv'), row.names = FALSE)
+write.csv(data.frame(row_id = test$row_id), file.path(output_dir, 'test_split.csv'), row.names = FALSE)
+capture.output(sessionInfo(), file = file.path(output_dir, 'R_session_info.txt'))
+cat('\nAll results saved in:', output_dir, '\n')
+# Do not repeatedly tune models using these test results.
+# The 2018-2020 data do not validate predictions for today's market.
+
+```
