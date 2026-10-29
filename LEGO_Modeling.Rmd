@@ -108,24 +108,127 @@ fit_predict <- function(a, b, model) {
 }
 rmse <- function(y, p) sqrt(mean((y - p)^2))
 mae <- function(y, p) mean(abs(y - p))
+```
 
-# 4. FIVE-FOLD CROSS-VALIDATION ON TRAINING DATA ---------------------------
-comparison <- data.frame(Model = model_names, CV_RMSE = NA_real_, CV_MAE = NA_real_)
-for (model in 1:5) {
-  predictions <- numeric(nrow(train))
-  for (fold in 1:5) {
-    validation <- fold_id == fold
-    predictions[validation] <- fit_predict(train[!validation, ],
-                                            train[validation, ], model)$prediction
-  }
-  comparison$CV_RMSE[model] <- rmse(train$Amazon_Price, predictions)
-  comparison$CV_MAE[model] <- mae(train$Amazon_Price, predictions)
+```{r}
+# ============================================================
+# FIX CHARACTER ENCODING ERROR IN LEGO CROSS-VALIDATION
+# ============================================================
+
+# 1. Back up the original training data
+train_backup <- train
+
+# 2. Identify character variables
+char_vars <- names(train)[sapply(train, is.character)]
+
+# 3. Examine original character encodings
+for (var in char_vars) {
+  cat("\nVariable:", var, "\n")
+  print(table(Encoding(train[[var]]), useNA = "ifany"))
 }
-print(comparison)
-write.csv(comparison, file.path(output_dir, 'model_comparison.csv'), row.names = FALSE)
-selected <- which.min(comparison$CV_RMSE)
-cat('\nSelected model:', model_names[selected], '\n')
 
+# 4. Convert character variables to UTF-8
+for (var in char_vars) {
+  train[[var]] <- iconv(
+    train[[var]],
+    from = "",
+    to = "UTF-8",
+    sub = NA
+  )
+}
+
+# 5. Check whether conversion introduced missing values
+for (var in char_vars) {
+  new_missing <- sum(is.na(train[[var]]) &
+                    !is.na(train_backup[[var]]))
+
+  cat(var, "- New missing values:", new_missing, "\n")
+}
+
+# 6. Verify that categorical values can be sorted
+for (var in char_vars) {
+  cat("\nChecking:", var, "\n")
+
+  result <- try(
+    sort(unique(train[[var]])),
+    silent = TRUE
+  )
+
+  if (inherits(result, "try-error")) {
+    cat("Sorting failed:", var, "\n")
+  } else {
+    cat("Sorting successful\n")
+  }
+}
+
+# 7. Test the previously failing Model 4, Fold 1
+validation <- fold_id == 1
+
+test_result <- try(
+  fit_predict(
+    train[!validation, ],
+    train[validation, ],
+    4
+  ),
+  silent = TRUE
+)
+
+# 8. Check if Model 4 works
+if (inherits(test_result, "try-error")) {
+
+  cat("\nModel 4 still failed.\n")
+  print(test_result)
+
+} else {
+
+  cat("\nModel 4, Fold 1 completed successfully!\n")
+
+  # 9. Run the complete five-fold cross-validation
+  comparison <- data.frame(
+    Model = model_names,
+    CV_RMSE = NA_real_,
+    CV_MAE = NA_real_
+  )
+
+  for (model in 1:5) {
+
+    predictions <- numeric(nrow(train))
+
+    for (fold in 1:5) {
+
+      cat("Model:", model, "Fold:", fold, "\n")
+
+      validation <- fold_id == fold
+
+      predictions[validation] <- fit_predict(
+        train[!validation, ],
+        train[validation, ],
+        model
+      )$prediction
+    }
+
+    comparison$CV_RMSE[model] <- rmse(
+      train$Amazon_Price,
+      predictions
+    )
+
+    comparison$CV_MAE[model] <- mae(
+      train$Amazon_Price,
+      predictions
+    )
+  }
+
+  # 10. Display model comparison results
+  print(comparison)
+
+  # 11. Select model with lowest cross-validation RMSE
+  selected <- which.min(comparison$CV_RMSE)
+
+  cat("\nSelected model:", model_names[selected], "\n")
+}
+```
+
+```{r}
 # 5. HELD-OUT EVALUATION --------------------------------------------------
 result <- fit_predict(train, test, selected)
 pred <- result$prediction
@@ -208,5 +311,612 @@ capture.output(sessionInfo(), file = file.path(output_dir, 'R_session_info.txt')
 cat('\nAll results saved in:', output_dir, '\n')
 # Do not repeatedly tune models using these test results.
 # The 2018-2020 data do not validate predictions for today's market.
+```
+
+```{r}
+
+# ============================================================
+# MODEL 6: RIDGE REGRESSION
+# Nested 5-fold CV; original test set remains untouched
+# ============================================================
+
+if (!requireNamespace("glmnet", quietly = TRUE)) {
+  install.packages("glmnet")
+}
+library(glmnet)
+
+# Candidate penalty values
+lambda_grid <- 10^seq(-2, 3, length.out = 50)
+
+# Fit Ridge and predict at multiple lambda values
+ridge_predictions <- function(a, b, lambdas) {
+
+  # Same predictors and preprocessing as Model 4
+  design <- make_design(a, b, 4)
+
+  X_train <- design$A[, -1, drop = FALSE]
+  X_new <- design$B[, -1, drop = FALSE]
+  y_train <- log(a$Amazon_Price)
+
+  ridge_fit <- glmnet(
+    x = X_train,
+    y = y_train,
+    alpha = 0,
+    lambda = lambdas,
+    standardize = TRUE
+  )
+
+  # Predictions on log scale
+  log_train <- as.matrix(predict(
+    ridge_fit, newx = X_train, s = lambdas
+  ))
+  log_new <- as.matrix(predict(
+    ridge_fit, newx = X_new, s = lambdas
+  ))
+
+  # Training-only smearing factors, one per lambda
+  smear <- colMeans(exp(
+    sweep(log_train, 1, y_train, FUN = "-") * -1
+  ))
+
+  # Back-transform to original dollar scale
+  prediction <- sweep(exp(log_new), 2, smear, "*")
+
+  prediction
+}
+
+# ------------------------------------------------------------
+# Inner CV: choose lambda using dollar-scale RMSE
+# ------------------------------------------------------------
+
+tune_ridge <- function(a, lambdas, seed = 123) {
+
+  set.seed(seed)
+  inner_fold <- sample(rep(1:5, length.out = nrow(a)))
+
+  squared_error <- numeric(length(lambdas))
+
+  for (k in 1:5) {
+
+    val <- inner_fold == k
+
+    prediction <- ridge_predictions(
+      a[!val, ],
+      a[val, ],
+      lambdas
+    )
+
+    errors <- sweep(
+      prediction, 1, a$Amazon_Price[val], "-"
+    )
+
+    squared_error <- squared_error +
+      colSums(errors^2)
+  }
+
+  cv_rmse <- sqrt(squared_error / nrow(a))
+
+  list(
+    best_lambda = lambdas[which.min(cv_rmse)],
+    cv_rmse = cv_rmse
+  )
+}
+
+# ------------------------------------------------------------
+# Outer CV: evaluate Ridge using original folds
+# ------------------------------------------------------------
+
+ridge_oof <- numeric(nrow(train))
+ridge_lambdas <- numeric(5)
+
+for (fold in 1:5) {
+
+  validation <- fold_id == fold
+
+  outer_train <- train[!validation, ]
+  outer_validation <- train[validation, ]
+
+  tuned <- tune_ridge(
+    outer_train,
+    lambda_grid,
+    seed = 123 + fold
+  )
+
+  ridge_lambdas[fold] <- tuned$best_lambda
+
+  ridge_oof[validation] <- drop(ridge_predictions(
+    outer_train,
+    outer_validation,
+    tuned$best_lambda
+  ))
+
+  cat("Outer fold:", fold,
+      "Selected lambda:", tuned$best_lambda, "\n")
+}
+
+# ------------------------------------------------------------
+# Compare Model 6 with Model 4
+# ------------------------------------------------------------
+
+ridge_rmse <- rmse(train$Amazon_Price, ridge_oof)
+ridge_mae <- mae(train$Amazon_Price, ridge_oof)
+
+ridge_comparison <- rbind(
+  comparison[4, ],
+  data.frame(
+    Model = "Ridge: log price + theme",
+    CV_RMSE = ridge_rmse,
+    CV_MAE = ridge_mae
+  )
+)
+
+print(ridge_comparison)
+
+# ------------------------------------------------------------
+# Tune Ridge on all training observations
+# Do not use the test data to select lambda
+# ------------------------------------------------------------
+
+final_tuning <- tune_ridge(
+  train,
+  lambda_grid,
+  seed = 456
+)
+
+cat("Final Ridge lambda:",
+    final_tuning$best_lambda, "\n")
+
+# Save cross-validation comparison
+write.csv(
+  ridge_comparison,
+  file.path(output_dir, "ridge_comparison.csv"),
+  row.names = FALSE
+)
 
 ```
+
+```{r}
+
+# Model 4 vs Ridge: CV RMSE and MAE
+values <- rbind(
+  ridge_comparison$CV_RMSE,
+  ridge_comparison$CV_MAE
+)
+
+rownames(values) <- c("CV RMSE", "CV MAE")
+colnames(values) <- c("Model 4: OLS", "Model 6: Ridge")
+
+barplot(
+  values,
+  beside = TRUE,
+  col = c("gray50", "gray80"),
+  ylim = c(0, 48),
+  ylab = "Prediction Error ($)",
+  main = "Model 4 vs. Ridge Regression",
+  legend.text = TRUE,
+  args.legend = list(x = "topright", bty = "n")
+)
+
+```
+
+```{r}
+
+# ============================================================
+# MODEL 7: LASSO REGRESSION
+# Nested five-fold cross-validation
+# ============================================================
+
+library(glmnet)
+
+# 1. Candidate lambda values
+lambda_grid_lasso <- c(
+  0,
+  10^seq(-5, 3, length.out = 100)
+)
+
+# 2. Fit LASSO and predict on the dollar scale
+lasso_predictions <- function(a, b, lambdas) {
+
+  # Same predictors as Model 4
+  design <- make_design(a, b, 4)
+
+  X_train <- design$A[, -1, drop = FALSE]
+  X_new <- design$B[, -1, drop = FALSE]
+  y_train <- log(a$Amazon_Price)
+
+  # L1 regularization
+  fit <- glmnet(
+    x = X_train,
+    y = y_train,
+    alpha = 1,
+    lambda = lambdas,
+    standardize = TRUE
+  )
+
+  # Predict training and validation log-prices
+  log_train <- as.matrix(
+    predict(fit, newx = X_train, s = lambdas)
+  )
+
+  log_new <- as.matrix(
+    predict(fit, newx = X_new, s = lambdas)
+  )
+
+  # Smearing correction based on fitting observations
+  smear <- colMeans(
+    exp(sweep(log_train, 1, y_train, FUN = "-") * -1)
+  )
+
+  # Convert predictions to dollars
+  predictions <- sweep(exp(log_new), 2, smear, "*")
+
+  predictions
+}
+
+# 3. Tune lambda using five-fold inner CV
+tune_lasso <- function(a, lambdas, seed = 123) {
+
+  set.seed(seed)
+  inner_fold <- sample(rep(1:5, length.out = nrow(a)))
+
+  squared_error <- numeric(length(lambdas))
+
+  for (k in 1:5) {
+
+    val <- inner_fold == k
+
+    predictions <- lasso_predictions(
+      a[!val, ],
+      a[val, ],
+      lambdas
+    )
+
+    errors <- sweep(
+      predictions, 1, a$Amazon_Price[val], "-"
+    )
+
+    squared_error <- squared_error + colSums(errors^2)
+  }
+
+  cv_rmse <- sqrt(squared_error / nrow(a))
+
+  list(
+    best_lambda = lambdas[which.min(cv_rmse)],
+    cv_rmse = cv_rmse
+  )
+}
+
+# 4. Outer CV: obtain out-of-fold predictions
+lasso_oof <- numeric(nrow(train))
+lasso_lambdas <- numeric(5)
+
+for (fold in 1:5) {
+
+  validation <- fold_id == fold
+
+  outer_train <- train[!validation, ]
+  outer_validation <- train[validation, ]
+
+  tuned <- tune_lasso(
+    outer_train,
+    lambda_grid_lasso,
+    seed = 123 + fold
+  )
+
+  lasso_lambdas[fold] <- tuned$best_lambda
+
+  lasso_oof[validation] <- drop(lasso_predictions(
+    outer_train,
+    outer_validation,
+    tuned$best_lambda
+  ))
+
+  cat("Outer fold:", fold,
+      "Selected lambda:", tuned$best_lambda, "\n")
+}
+
+# 5. Cross-validation metrics
+lasso_rmse <- rmse(train$Amazon_Price, lasso_oof)
+lasso_mae <- mae(train$Amazon_Price, lasso_oof)
+
+# 6. Compare OLS, Ridge, and LASSO
+lasso_comparison <- rbind(
+  ridge_comparison,
+  data.frame(
+    Model = "LASSO: log price + theme",
+    CV_RMSE = lasso_rmse,
+    CV_MAE = lasso_mae
+  )
+)
+
+print(lasso_comparison)
+
+# 7. Tune final lambda using training data only
+final_lasso_tuning <- tune_lasso(
+  train,
+  lambda_grid_lasso,
+  seed = 456
+)
+
+best_lasso_lambda <- final_lasso_tuning$best_lambda
+
+cat("Final LASSO lambda:", best_lasso_lambda, "\n")
+
+# 8. Fit final LASSO and identify selected predictors
+design <- make_design(train, train, 4)
+
+X <- design$A[, -1, drop = FALSE]
+
+final_lasso <- glmnet(
+  x = X,
+  y = log(train$Amazon_Price),
+  alpha = 1,
+  lambda = best_lasso_lambda,
+  standardize = TRUE
+)
+
+lasso_coef <- as.matrix(coef(final_lasso))
+
+selected_predictors <- data.frame(
+  Predictor = rownames(lasso_coef),
+  Coefficient = as.numeric(lasso_coef[, 1])
+)
+
+selected_predictors <- selected_predictors[
+  selected_predictors$Coefficient != 0 &
+  selected_predictors$Predictor != "(Intercept)",
+]
+
+cat("\nNumber of selected predictors:",
+    nrow(selected_predictors), "\n")
+
+print(selected_predictors)
+
+# 9. Save results
+write.csv(
+  lasso_comparison,
+  file.path(output_dir, "lasso_comparison.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  selected_predictors,
+  file.path(output_dir, "lasso_selected_predictors.csv"),
+  row.names = FALSE
+)
+
+```
+
+```{r}
+
+# Graph 1: Cross-validation RMSE and MAE
+
+plot_data <- rbind(
+  lasso_comparison$CV_RMSE,
+  lasso_comparison$CV_MAE
+)
+
+rownames(plot_data) <- c("CV RMSE", "CV MAE")
+colnames(plot_data) <- c("OLS", "Ridge", "LASSO")
+
+png(file.path(output_dir, "three_model_comparison.png"),
+    width = 1800, height = 1100, res = 200)
+
+bp <- barplot(
+  plot_data,
+  beside = TRUE,
+  col = c("gray35", "gray75"),
+  ylim = c(0, 48),
+  main = "OLS vs. Ridge vs. LASSO",
+  ylab = "Cross-validation error ($)",
+  legend.text = TRUE,
+  args.legend = list(x = "topright", bty = "n")
+)
+
+text(
+  bp,
+  plot_data + 1,
+  labels = sprintf("%.2f", plot_data),
+  cex = 0.8
+)
+
+dev.off()
+
+```
+
+```{r}
+
+# Graph 3: Inner CV RMSE versus lambda
+# Exclude lambda = 0 from the logarithmic X-axis
+
+valid <- lambda_grid_lasso > 0
+
+png(file.path(output_dir, "lasso_lambda_cv.png"),
+    width = 1800, height = 1100, res = 200)
+
+plot(
+  lambda_grid_lasso[valid],
+  final_lasso_tuning$cv_rmse[valid],
+  type = "l",
+  log = "x",
+  lwd = 2,
+  xlab = "Lambda (log scale)",
+  ylab = "Inner CV RMSE ($)",
+  main = "LASSO: Penalty Selection"
+)
+
+abline(
+  v = best_lasso_lambda,
+  lty = 2,
+  lwd = 2
+)
+
+dev.off()
+
+file.show(file.path(output_dir, "lasso_lambda_cv.png"))
+
+```
+
+```{r}
+plot(
+  lambda_grid,
+  final_tuning$cv_rmse,
+  type = "l",
+  log = "x",
+  lwd = 2,
+  xlab = "Regularization Strength (Lambda)",
+  ylab = "Cross-Validation RMSE ($)",
+  main = "Ridge: Cross-Validation Error vs. Lambda"
+)
+
+abline(
+  v = final_tuning$best_lambda,
+  lty = 2,
+  lwd = 2
+)
+```
+```{r}
+
+# Ridge: Observed vs. Predicted Prices
+
+observed <- train$Amazon_Price
+predicted <- ridge_oof
+
+# Graph 1: Full range
+plot(
+  observed, predicted,
+  pch = 16,
+  col = "gray50",
+  xlim = c(0, max(observed, predicted)),
+  ylim = c(0, max(observed, predicted)),
+  xlab = "Observed Amazon Price ($)",
+  ylab = "Predicted Amazon Price ($)",
+  main = "Ridge: Observed vs. Predicted Prices"
+)
+
+abline(0, 1, lty = 2, col = "black")
+
+
+# Graph 2: Zoomed-in view
+plot(
+  observed, predicted,
+  pch = 16,
+  col = "gray50",
+  xlim = c(0, 200),
+  ylim = c(0, 200),
+  xlab = "Observed Amazon Price ($)",
+  ylab = "Predicted Amazon Price ($)",
+  main = "Ridge: Observed vs. Predicted Prices (Zoomed)"
+)
+
+abline(0, 1, lty = 2, col = "black")
+
+```
+
+
+
+```{r}
+
+# Count total, retained, and eliminated coefficients
+
+total_predictors <- ncol(X)
+
+retained_predictors <- nrow(selected_predictors)
+
+removed_predictors <- total_predictors - retained_predictors
+
+selection_summary <- data.frame(
+  Measure = c(
+    "Total predictor coefficients",
+    "Retained coefficients",
+    "Eliminated coefficients",
+    "Percentage eliminated"
+  ),
+  Value = c(
+    total_predictors,
+    retained_predictors,
+    removed_predictors,
+    round(100 * removed_predictors / total_predictors, 2)
+  )
+)
+
+print(selection_summary)
+
+```
+
+```{r}
+
+# Selection stability across five outer training folds
+library(glmnet)
+
+selection_list <- vector("list", 5)
+
+for (fold in 1:5) {
+
+  validation <- fold_id == fold
+
+  fold_train <- train[!validation, ]
+
+  design_fold <- make_design(
+    fold_train, fold_train, 4
+  )
+
+  X_fold <- design_fold$A[, -1, drop = FALSE]
+
+  fit_fold <- glmnet(
+    x = X_fold,
+    y = log(fold_train$Amazon_Price),
+    alpha = 1,
+    lambda = lasso_lambdas[fold],
+    standardize = TRUE
+  )
+
+  coefs <- as.matrix(coef(fit_fold))
+
+  selected <- rownames(coefs)[
+    as.numeric(coefs[, 1]) != 0
+  ]
+
+  selection_list[[fold]] <- setdiff(
+    selected, "(Intercept)"
+  )
+}
+
+# Count how often each predictor was selected
+all_predictors <- sort(unique(
+  unlist(selection_list)
+))
+
+selection_frequency <- sapply(
+  all_predictors,
+  function(v) {
+    sum(sapply(selection_list, function(s) v %in% s))
+  }
+)
+
+stability_table <- data.frame(
+  Predictor = all_predictors,
+  Folds_Selected = as.integer(selection_frequency),
+  Selection_Percentage = 100 * selection_frequency / 5
+)
+
+stability_table <- stability_table[
+  order(-stability_table$Folds_Selected),
+]
+
+print(stability_table)
+
+write.csv(
+  stability_table,
+  file.path(output_dir, "lasso_selection_stability.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+
+
+
+
+
